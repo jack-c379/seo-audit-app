@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Search, FileText, AlertCircle, CheckCircle, Loader2, Globe } from 'lucide-react';
 
 export default function SEOAuditApp() {
@@ -6,8 +6,46 @@ export default function SEOAuditApp() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
+  const [serverWakingUp, setServerWakingUp] = useState(true);
 
   const API_BASE_URL = 'https://seo-audit-app-s1y0.onrender.com';
+
+  // Ping the backend on initial load to wake it up if it's sleeping
+  useEffect(() => {
+    const wakeUpServer = async () => {
+      try {
+        setServerWakingUp(true);
+        const response = await fetch(`${API_BASE_URL}/ping`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          console.log('Server is awake:', data);
+          setServerWakingUp(false);
+        } else {
+          // Server might be waking up, don't show error immediately
+          console.log('Server waking up...');
+          // Retry after a short delay
+          setTimeout(() => {
+            setServerWakingUp(false);
+          }, 2000);
+        }
+      } catch (err) {
+        // Network error - server is likely waking up
+        console.log('Server is waking up, please wait...', err.message);
+        // Still set to false after a delay to allow user to try
+        setTimeout(() => {
+          setServerWakingUp(false);
+        }, 3000);
+      }
+    };
+
+    wakeUpServer();
+  }, []);
 
   const handleAudit = async (e) => {
     e.preventDefault();
@@ -93,6 +131,21 @@ export default function SEOAuditApp() {
           </form>
         </div>
 
+        {/* Server Wake-up Message */}
+        {serverWakingUp && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-6 mb-8">
+            <div className="flex items-start">
+              <Loader2 className="w-6 h-6 text-yellow-600 mr-3 flex-shrink-0 mt-0.5 animate-spin" />
+              <div>
+                <h3 className="text-yellow-800 font-semibold mb-1">Server is waking up</h3>
+                <p className="text-yellow-700">
+                  Please wait a moment while the backend server wakes up. This usually takes 30-60 seconds if the server has been idle.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Error Message */}
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-xl p-6 mb-8">
@@ -102,7 +155,9 @@ export default function SEOAuditApp() {
                 <h3 className="text-red-800 font-semibold mb-1">Error</h3>
                 <p className="text-red-700">{error}</p>
                 <p className="text-red-600 text-sm mt-2">
-                  Note: The backend may take 30-60 seconds to wake up if it's been idle.
+                  {serverWakingUp 
+                    ? 'Server is still waking up. Please wait a moment and try again.' 
+                    : 'If the backend was idle, it may take 30-60 seconds to wake up.'}
                 </p>
               </div>
             </div>
@@ -152,7 +207,7 @@ export default function SEOAuditApp() {
         )}
 
         {/* Info Card */}
-        {!result && !loading && (
+        {!result && !loading && !serverWakingUp && (
           <div className="bg-blue-50 border border-blue-200 rounded-xl p-6 text-center">
             <p className="text-blue-800">
               Enter a website URL above to get started with your SEO audit

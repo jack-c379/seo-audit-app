@@ -376,15 +376,34 @@ if __name__ == "__main__":
         # Create FastAPI app with ADK agent
         app = create_adk_app(root_agent)
         
+        # Add a lightweight ping endpoint to wake up the server
+        @app.get("/ping")
+        async def ping():
+            """Lightweight health check endpoint to wake up the server."""
+            return {"status": "ok", "message": "Server is awake"}
+        
         # Add CORS middleware to allow Next.js frontend to connect
+        # Build allowed origins list
+        allowed_origins = [
+            "http://localhost:3000",  # Next.js dev server
+            "http://localhost:3001",  # Alternative Next.js port
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:3001",
+        ]
+        
+        # Add production origins from environment variable (comma-separated)
+        # Set ALLOWED_ORIGINS in Render dashboard: https://your-frontend.vercel.app,https://another-domain.com
+        production_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+        if production_origins:
+            for origin in production_origins.split(","):
+                origin = origin.strip()
+                if origin and origin not in allowed_origins:
+                    allowed_origins.append(origin)
+                    logger.info(f"Added CORS origin from environment: {origin}")
+        
         app.add_middleware(
             CORSMiddleware,
-            allow_origins=[
-                "http://localhost:3000",  # Next.js dev server
-                "http://localhost:3001",  # Alternative Next.js port
-                "http://127.0.0.1:3000",
-                "http://127.0.0.1:3001",
-            ],
+            allow_origins=allowed_origins,
             allow_credentials=True,
             allow_methods=["*"],
             allow_headers=["*"],
@@ -400,8 +419,12 @@ if __name__ == "__main__":
             print(f"Sub-agents: {len(root_agent.sub_agents)}")
             for i, sub_agent in enumerate(root_agent.sub_agents, 1):
                 print(f"  {i}. {sub_agent.name}")
+        # Get port for display
+        port = int(os.getenv("PORT", "8000"))
         print("\n📡 Server will be available at:")
-        print("   http://localhost:8000")
+        print(f"   http://0.0.0.0:{port}")
+        if os.getenv("RENDER") or os.getenv("PORT"):
+            print(f"   (Render will assign public URL)")
         print("\n💡 To use with ADK web UI, run:")
         print("   cd .. && adk web")
         print("\n💡 To use with Next.js frontend:")
@@ -410,7 +433,9 @@ if __name__ == "__main__":
         print("\nStarting server...\n")
         
         # Start the server
-        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+        # Use PORT from environment (Render sets this automatically), fallback to 8000 for local dev
+        port = int(os.getenv("PORT", "8000"))
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
         
     except ImportError as e:
         logger.error(f"Failed to import server dependencies: {e}")

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: seo-audit-agent
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: |
+      python3 -m venv .venv
+      source .venv/bin/activate
+      pip install --upgrade pip
+      cd agent && pip install -r requirements.txt
+    startCommand: |
+      cd agent && ../.venv/bin/python agent.py
+    envVars:
+      # Render automatically sets PORT - no need to specify
+      - key: PYTHON_VERSION
+        value: 3.12
+      # Set these in Render dashboard (Environment tab) for security:
+      # - GOOGLE_API_KEY: Your Google Gemini API key
+      # - FIRECRAWL_API_KEY: Your Firecrawl API key (if using)
+      # - ALLOWED_ORIGINS: Comma-separated list of frontend URLs
+      #   Example: https://your-app.vercel.app,https://your-custom-domain.com
+      - key: ALLOWED_ORIGINS
+        sync: false  # Set manually in Render dashboard
+      - key: GOOGLE_API_KEY
+        sync: false  # Set manually in Render dashboard
+      - key: FIRECRAWL_API_KEY
+        sync: false  # Set manually in Render dashboard (optional)
+    healthCheckPath: /
+    numInstances: 1
+

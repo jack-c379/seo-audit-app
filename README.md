@@ -1,152 +1,207 @@
-# CopilotKit <> ADK Starter
+# SEO Audit Agent - Backend
 
-This is a starter template for building AI agents using Google's [ADK](https://google.github.io/adk-docs/) and [CopilotKit](https://copilotkit.ai). It provides a modern Next.js application with an integrated investment analyst agent that can research stocks, analyze market data, and provide investment insights.
+A Python-based SEO audit agent built with Google's [ADK](https://google.github.io/adk-docs/) that performs comprehensive SEO analysis using a three-stage pipeline: page audit, SERP analysis, and optimization recommendations.
+
+## Features
+
+- **Page Auditor**: Analyzes on-page SEO elements including meta tags, headings, content structure, and links
+- **SERP Analyst**: Performs competitive analysis by examining top-ranking pages for target keywords
+- **Optimization Advisor**: Generates prioritized recommendations with actionable next steps
 
 ## Prerequisites
 
-- Node.js 18+
 - Python 3.10+ (3.12+ recommended)
   - **Note:** Python 3.10+ is required for MCP tools. The setup script will automatically check for a compatible version.
   - On macOS, install via Homebrew: `brew install python@3.12`
   - Or download from [python.org](https://www.python.org/downloads/)
-- Google Makersuite API Key (for the ADK agent) (see https://makersuite.google.com/app/apikey)
-- Any of the following package managers:
-  - pnpm (recommended)
-  - npm
-  - yarn
-  - bun
-
-> **Note:** This repository ignores lock files (package-lock.json, yarn.lock, pnpm-lock.yaml, bun.lockb) to avoid conflicts between different package managers. Each developer should generate their own lock file using their preferred package manager. After that, make sure to delete it from the .gitignore.
+- Google API Key (for the ADK agent) - see https://makersuite.google.com/app/apikey
+- Firecrawl API Key (optional, for web scraping) - see https://firecrawl.dev
 
 ## Getting Started
 
-1. Install dependencies using your preferred package manager:
+### 1. Install Python Dependencies
+
+Run the setup script to create a virtual environment and install dependencies:
+
 ```bash
-# Using pnpm (recommended)
-pnpm install
-
-# Using npm
-npm install
-
-# Using yarn
-yarn install
-
-# Using bun
-bun install
+./scripts/setup-agent.sh
 ```
 
-2. Install Python dependencies for the ADK agent:
-```bash
-# Using pnpm
-pnpm install:agent
+Or using npm (if you have package.json scripts):
 
-# Using npm
+```bash
 npm run install:agent
-
-# Using yarn
-yarn install:agent
-
-# Using bun
-bun run install:agent
 ```
 
-> **Note:** This will automatically setup a `.venv` (virtual environment) inside the `agent` directory using Python 3.10+.
->
-> The setup script will:
-> - Check for Python 3.10 or higher
-> - Create a new virtual environment if one doesn't exist
-> - Remove and recreate an existing virtual environment if it uses Python < 3.10
->
-> To activate the virtual environment manually, you can run:
-> ```bash
-> source agent/.venv/bin/activate
-> ```
+This will:
+- Check for Python 3.10 or higher
+- Create a new virtual environment (`.venv`) in the project root
+- Install all required Python packages
 
+### 2. Set Up Environment Variables
 
-3. Set up your Google API key:
+Create a `.env` file in the root directory (or set environment variables):
+
 ```bash
-export GOOGLE_API_KEY="your-google-api-key-here"
+# Required
+GOOGLE_API_KEY=your-google-api-key-here
+
+# Optional - for web scraping features
+FIRECRAWL_API_KEY=your-firecrawl-api-key-here
+
+# CORS Configuration (for production deployment)
+# Comma-separated list of allowed origins
+ALLOWED_ORIGINS=https://your-frontend-domain.com
 ```
 
-4. Start the development server:
+### 3. Run the Agent
+
+Start the agent server:
+
 ```bash
-# Using pnpm
-pnpm dev
-
-# Using npm
-npm run dev
-
-# Using yarn
-yarn dev
-
-# Using bun
-bun run dev
+./scripts/run-agent.sh
 ```
 
-This will start both the UI and agent servers concurrently.
+Or directly:
 
-## Available Scripts
-The following scripts can also be run using your preferred package manager:
-- `dev` - Starts both UI and agent servers in development mode
-- `dev:debug` - Starts development servers with debug logging enabled
-- `dev:ui` - Starts only the Next.js UI server
-- `dev:agent` - Starts only the ADK agent server
-- `build` - Builds the Next.js application for production
-- `start` - Starts the production server
-- `lint` - Runs ESLint for code linting
-- `install:agent` - Installs Python dependencies for the agent
+```bash
+cd agent
+../.venv/bin/python agent.py
+```
 
-## Documentation
+The agent will start a FastAPI server on `http://localhost:8000` (or the port specified by the `PORT` environment variable).
 
-The main UI component is in `src/app/page.tsx`. You can:
-- Modify the theme colors and styling
-- Add new frontend actions
-- Customize the CopilotKit sidebar appearance
+## Project Structure
+
+```
+seo-audit-app/
+├── agent/
+│   ├── agent.py          # Main agent implementation
+│   └── requirements.txt  # Python dependencies
+├── scripts/
+│   ├── setup-agent.sh    # Setup script for virtual environment
+│   └── run-agent.sh      # Script to run the agent
+├── render.yaml           # Render deployment configuration
+└── README.md            # This file
+```
+
+## Agent Pipeline
+
+The agent uses a sequential pipeline with three sub-agents:
+
+1. **PageAuditor**: Analyzes the target page for SEO elements
+2. **SerpAnalyst**: Examines SERP results for competitive insights
+3. **OptimizationAdvisor**: Generates comprehensive optimization recommendations
+
+## API Endpoints
+
+When the agent server is running, it exposes a FastAPI application:
+
+- `POST /` - Main agent endpoint (used by ADK/AG-UI clients)
+- `GET /docs` - Interactive API documentation (Swagger UI)
+- `GET /redoc` - Alternative API documentation (ReDoc)
+- `GET /openapi.json` - OpenAPI schema
+
+## Development
+
+### Manual Virtual Environment Setup
+
+If you prefer to set up the virtual environment manually:
+
+```bash
+# Create virtual environment
+python3 -m venv .venv
+
+# Activate virtual environment
+source .venv/bin/activate  # On macOS/Linux
+# or
+.venv\Scripts\activate  # On Windows
+
+# Install dependencies
+cd agent
+pip install -r requirements.txt
+```
+
+### Running in Development Mode
+
+The agent can be run directly for development:
+
+```bash
+cd agent
+../.venv/bin/python agent.py
+```
+
+## Deployment
+
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for detailed deployment instructions on Render.
+
+Quick deployment steps:
+
+1. Push code to a Git repository (GitHub, GitLab, etc.)
+2. Connect repository to Render
+3. Use `render.yaml` for automatic configuration
+4. Set environment variables in Render dashboard:
+   - `GOOGLE_API_KEY`
+   - `ALLOWED_ORIGINS` (comma-separated frontend URLs)
+   - `FIRECRAWL_API_KEY` (optional)
+
+## Troubleshooting
+
+### Python Version Error
+
+If you see "MCP requires Python 3.10+":
+
+```bash
+# Check your Python version
+python3 --version
+
+# If you need to install Python 3.10+:
+# On macOS:
+brew install python@3.12
+
+# Then recreate the virtual environment:
+rm -rf .venv
+./scripts/setup-agent.sh
+```
+
+### Module Import Errors
+
+If you encounter import errors:
+
+```bash
+# Ensure virtual environment is activated
+source .venv/bin/activate
+
+# Reinstall dependencies
+cd agent
+pip install -r requirements.txt
+```
+
+### API Key Errors
+
+Make sure your `GOOGLE_API_KEY` is set correctly:
+
+```bash
+export GOOGLE_API_KEY="your-api-key-here"
+```
+
+Or add it to a `.env` file in the root directory.
+
+### Port Already in Use
+
+If port 8000 is already in use:
+
+```bash
+# Use a different port
+PORT=8001 ./scripts/run-agent.sh
+```
 
 ## 📚 Documentation
 
 - [ADK Documentation](https://google.github.io/adk-docs/) - Learn more about the ADK and its features
-- [CopilotKit Documentation](https://docs.copilotkit.ai) - Explore CopilotKit's capabilities
-- [Next.js Documentation](https://nextjs.org/docs) - Learn about Next.js features and API
-
-
-## Contributing
-
-Feel free to submit issues and enhancement requests! This starter is designed to be easily extensible.
+- [FastAPI Documentation](https://fastapi.tiangolo.com/) - FastAPI framework documentation
+- [Pydantic Documentation](https://docs.pydantic.dev/) - Data validation library
 
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Troubleshooting
-
-### Agent Connection Issues
-If you see "I'm having trouble connecting to my tools", make sure:
-1. The ADK agent is running on port 8000
-2. Your Google API key is set correctly
-3. Both servers started successfully
-
-### Python Dependencies
-If you encounter Python import errors or version-related errors:
-
-1. **Python Version Error (MCP requires Python 3.10+):**
-   ```bash
-   # Check your Python version
-   python3 --version
-   
-   # If you need to install Python 3.10+:
-   # On macOS:
-   brew install python@3.12
-   
-   # Then recreate the virtual environment:
-   cd agent
-   rm -rf .venv
-   npm run install:agent
-   ```
-
-2. **General Python import errors:**
-   ```bash
-   cd agent
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
