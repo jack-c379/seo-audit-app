@@ -1,7 +1,11 @@
 #!/bin/bash
 
-# Navigate to the agent directory
-cd "$(dirname "$0")/../agent" || exit 1
+# Navigate to the project root directory (where .venv should be)
+PROJECT_ROOT="$(dirname "$0")/.."
+cd "$PROJECT_ROOT" || exit 1
+
+# Agent directory
+AGENT_DIR="$PROJECT_ROOT/agent"
 
 # Function to check Python version (must be 3.10+)
 check_python_version() {
@@ -85,14 +89,14 @@ if [ -d ".venv" ]; then
   fi
 fi
 
-# Create virtual environment if it doesn't exist
+# Create virtual environment in project root if it doesn't exist
 if [ ! -d ".venv" ]; then
-  echo "Creating virtual environment with $PYTHON_CMD..."
+  echo "Creating virtual environment in project root with $PYTHON_CMD..."
   "$PYTHON_CMD" -m venv .venv || exit 1
 fi
 
 # Activate the virtual environment
 source .venv/bin/activate
 
-# Install requirements using pip
-pip install -r requirements.txt
+# Install requirements using pip from agent directory
+pip install -r "$AGENT_DIR/requirements.txt"

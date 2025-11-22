@@ -1,14 +1,80 @@
+"""
+SEO Audit Agent - ADK Agent for comprehensive SEO auditing
+
+IMPORTANT: This file should be run using the project's run script, not directly:
+  - Use: npm run dev:agent
+  - Or: ./scripts/run-agent.sh
+  
+Running python agent.py directly will fail because it needs the virtual environment.
+"""
+
 from pydantic import BaseModel, Field
 from typing import List, Dict, Optional
 import os
+import sys
 import logging
 import time
 import re
-from google.adk.tools.mcp_tool.mcp_toolset import MCPToolset, StdioConnectionParams
-from mcp.client.stdio import StdioServerParameters
-from google.adk.agents import LlmAgent, SequentialAgent
-from google.adk.tools import google_search
-from google.adk.tools.agent_tool import AgentTool
+
+# Check Python version FIRST - MCP requires Python 3.10+
+if sys.version_info < (3, 10):
+    print("="*70, file=sys.stderr)
+    print("ERROR: Python 3.10+ is required but you're using Python {}.{}.".format(
+        sys.version_info.major, sys.version_info.minor), file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    print(f"\nCurrent Python: {sys.executable}", file=sys.stderr)
+    print(f"Python version: {sys.version}", file=sys.stderr)
+    print("\nSOLUTION: Run the agent using one of these methods:", file=sys.stderr)
+    print("  1. npm run dev:agent", file=sys.stderr)
+    print("  2. ./scripts/run-agent.sh", file=sys.stderr)
+    print("  3. cd .. && source .venv/bin/activate && cd agent && python agent.py", file=sys.stderr)
+    print("\nThese methods will use Python 3.12 from the parent .venv directory.", file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    sys.exit(1)
+
+# Automatically detect and use parent .venv if not already in venv
+# This allows agent.py to work when run directly from IDE or terminal
+_AGENT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PARENT_DIR = os.path.dirname(_AGENT_DIR)
+_PARENT_VENV_DIR = os.path.join(_PARENT_DIR, ".venv", "lib")
+
+# Check if parent .venv exists and find the correct Python version site-packages
+if os.path.exists(_PARENT_VENV_DIR):
+    # Find any Python version directory in .venv/lib
+    try:
+        python_dirs = [d for d in os.listdir(_PARENT_VENV_DIR) if d.startswith("python")]
+        if python_dirs:
+            # Use the first Python version found (should be only one)
+            _PARENT_VENV_SITE_PACKAGES = os.path.join(_PARENT_VENV_DIR, python_dirs[0], "site-packages")
+            if os.path.exists(_PARENT_VENV_SITE_PACKAGES):
+                sys.path.insert(0, _PARENT_VENV_SITE_PACKAGES)
+    except (OSError, IndexError):
+        pass
+
+# Check if running in virtual environment before importing ADK packages
+# This provides a helpful error message if run with system Python
+try:
+    # Type ignore comments are used because IDE linter can't see packages in parent .venv
+    # Runtime imports work correctly when using parent .venv Python interpreter
+    from google.adk.tools.mcp_tool.mcp_toolset import McpToolset, StdioConnectionParams  # type: ignore
+    from mcp.client.stdio import StdioServerParameters  # type: ignore
+    from google.adk.agents import LlmAgent, SequentialAgent  # type: ignore
+    from google.adk.tools import google_search  # type: ignore
+    from google.adk.tools.agent_tool import AgentTool  # type: ignore
+except ModuleNotFoundError as e:
+    print("="*70, file=sys.stderr)
+    print("ERROR: Module not found. You need to use the virtual environment.", file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    print(f"\nMissing module: {e.name}", file=sys.stderr)
+    print(f"Python path: {sys.executable}", file=sys.stderr)
+    print(f"Checked parent venv: {_PARENT_VENV_DIR}", file=sys.stderr)
+    print("\nSOLUTION: Run the agent using one of these methods:", file=sys.stderr)
+    print("  1. npm run dev:agent", file=sys.stderr)
+    print("  2. ./scripts/run-agent.sh", file=sys.stderr)
+    print("  3. cd .. && source .venv/bin/activate && cd agent && python agent.py", file=sys.stderr)
+    print("\nThe virtual environment (.venv) is in the parent directory.", file=sys.stderr)
+    print("="*70, file=sys.stderr)
+    sys.exit(1)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -172,7 +238,7 @@ if not FIRECRAWL_API_KEY:
     logger.warning("FIRECRAWL_API_KEY not set. Scraping may fail.")
 
 # Firecrawl MCP toolset
-firecrawl_toolset = MCPToolset(
+firecrawl_toolset = McpToolset(
     connection_params=StdioConnectionParams(
         server_params=StdioServerParameters(
             command='npx',
@@ -287,3 +353,70 @@ seo_audit_pipeline = SequentialAgent(
 
 # Root agent
 root_agent = seo_audit_pipeline
+
+# ============================================================================
+# Server Startup (when run directly)
+# ============================================================================
+
+if __name__ == "__main__":
+    """
+    Start the FastAPI server when agent.py is run directly.
+    
+    This creates a web server on port 8000 that exposes the agent
+    via ADK's web interface. The agent can then be accessed by:
+    - ADK web UI (adk web command)
+    - HTTP requests to http://localhost:8000/
+    - Next.js frontend via CopilotKit
+    """
+    try:
+        from ag_ui_adk import create_adk_app  # type: ignore
+        from fastapi.middleware.cors import CORSMiddleware
+        import uvicorn
+        
+        # Create FastAPI app with ADK agent
+        app = create_adk_app(root_agent)
+        
+        # Add CORS middleware to allow Next.js frontend to connect
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[
+                "http://localhost:3000",  # Next.js dev server
+                "http://localhost:3001",  # Alternative Next.js port
+                "http://127.0.0.1:3000",
+                "http://127.0.0.1:3001",
+            ],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Print startup information
+        print("="*70)
+        print("🤖 SEO Audit Agent Server Starting")
+        print("="*70)
+        print(f"Agent: {root_agent.name}")
+        print(f"Description: {root_agent.description}")
+        if hasattr(root_agent, 'sub_agents'):
+            print(f"Sub-agents: {len(root_agent.sub_agents)}")
+            for i, sub_agent in enumerate(root_agent.sub_agents, 1):
+                print(f"  {i}. {sub_agent.name}")
+        print("\n📡 Server will be available at:")
+        print("   http://localhost:8000")
+        print("\n💡 To use with ADK web UI, run:")
+        print("   cd .. && adk web")
+        print("\n💡 To use with Next.js frontend:")
+        print("   npm run dev")
+        print("="*70)
+        print("\nStarting server...\n")
+        
+        # Start the server
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+        
+    except ImportError as e:
+        logger.error(f"Failed to import server dependencies: {e}")
+        logger.error("Make sure fastapi, uvicorn, and ag-ui-adk are installed in your virtual environment.")
+        logger.error("Run: pip install -r requirements.txt")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        sys.exit(1)

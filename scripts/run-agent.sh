@@ -1,11 +1,16 @@
 #!/bin/bash
 
-# Navigate to the agent directory
-cd "$(dirname "$0")/../agent" || exit 1
+# Navigate to the project root directory (where .venv should be)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT" || exit 1
 
-# Check if virtual environment exists
+# Agent directory
+AGENT_DIR="$PROJECT_ROOT/agent"
+
+# Check if virtual environment exists in project root
 if [ ! -d ".venv" ]; then
-  echo "ERROR: Virtual environment not found. Please run the setup script first:" >&2
+  echo "ERROR: Virtual environment not found in project root. Please run the setup script first:" >&2
   echo "  npm run install:agent" >&2
   echo "  or" >&2
   echo "  ./scripts/setup-agent.sh" >&2
@@ -29,8 +34,15 @@ if [ -f "$VENV_PYTHON" ]; then
   fi
 fi
 
-# Activate the virtual environment
-source .venv/bin/activate
+# Use the virtual environment's Python directly (more reliable than activation)
+VENV_PYTHON="$PROJECT_ROOT/.venv/bin/python"
 
-# Run the agent
-.venv/bin/python agent.py
+# Verify venv Python exists
+if [ ! -f "$VENV_PYTHON" ]; then
+  echo "ERROR: Virtual environment Python not found at $VENV_PYTHON" >&2
+  exit 1
+fi
+
+# Navigate to agent directory and run the agent with venv Python
+cd "$AGENT_DIR" || exit 1
+"$VENV_PYTHON" agent.py
