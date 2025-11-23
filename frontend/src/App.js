@@ -8,6 +8,8 @@ export default function SEOAuditApp() {
   const [error, setError] = useState(null);
   const [serverWakingUp, setServerWakingUp] = useState(true);
   const [wakeUpLogs, setWakeUpLogs] = useState([]);
+  const [retryLogs, setRetryLogs] = useState([]);
+  const [sseConnection, setSseConnection] = useState(null);
 
   const API_BASE_URL = 'https://seo-audit-app-s1y0.onrender.com';
 
@@ -80,6 +82,12 @@ export default function SEOAuditApp() {
   const addLog = (message, type = 'info') => {
     const timestamp = formatTimestamp();
     setWakeUpLogs(prev => [...prev, { timestamp, message, type }]);
+  };
+
+  // Helper function to add retry log entry
+  const addRetryLog = (message, type = 'info') => {
+    const timestamp = formatTimestamp();
+    setRetryLogs(prev => [...prev, { timestamp, message, type }]);
   };
 
   // Ping the backend on initial load to wake it up if it's sleeping
@@ -170,11 +178,69 @@ export default function SEOAuditApp() {
     wakeUpServer();
   }, []);
 
+  // Wake up server before audit request - MUST succeed before proceeding
+  const wakeUpServerBeforeAudit = async () => {
+    const MAX_RETRIES = 8; // Increased retries for better reliability
+    const INITIAL_DELAY = 2000; // 2 seconds
+    const MAX_DELAY = 30000; // 30 seconds max between retries
+    
+    addRetryLog('Checking if backend server is awake before starting audit...', 'info');
+    addRetryLog('This may take 30-60 seconds if the server is in cold start', 'info');
+    
+    for (let retryCount = 0; retryCount < MAX_RETRIES; retryCount++) {
+      try {
+        addRetryLog(`Pinging server... (Attempt ${retryCount + 1}/${MAX_RETRIES})`, 'info');
+        
+        const startTime = Date.now();
+        const response = await fetch(`${API_BASE_URL}/ping`, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          signal: AbortSignal.timeout(15000), // 15 second timeout (increased for cold starts)
+        });
+
+        const endTime = Date.now();
+        const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+        if (response.ok) {
+          const data = await response.json();
+          addRetryLog(`✓ Server is awake and ready! (responded in ${duration}s)`, 'success');
+          addRetryLog(`Response: ${JSON.stringify(data)}`, 'success');
+          console.log('Server is awake:', data);
+          return true; // Server is awake - SUCCESS
+        } else {
+          addRetryLog(`⚠ Server responded with status ${response.status} (${duration}s) - may still be waking up...`, 'warning');
+          // Continue to retry
+        }
+      } catch (err) {
+        // Server is likely sleeping - will retry
+        const errorMsg = err.name === 'AbortError' ? 'Request timed out after 15 seconds' : err.message || 'Network error';
+        addRetryLog(`✗ Wake-up attempt failed: ${errorMsg}`, 'error');
+        addRetryLog(`Server may be in cold start (this is normal for Render free tier)`, 'info');
+        console.log(`Server wake-up attempt ${retryCount + 1}/${MAX_RETRIES} failed:`, err.message);
+        
+        // If not the last retry, wait before retrying
+        if (retryCount < MAX_RETRIES - 1) {
+          const delay = Math.min(INITIAL_DELAY * Math.pow(2, retryCount), MAX_DELAY);
+          addRetryLog(`Retrying in ${delay / 1000} seconds... (exponential backoff)`, 'info');
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    
+    // Max retries reached - server still not awake
+    addRetryLog(`❌ Max wake-up retries (${MAX_RETRIES}) reached. Server may still be waking up.`, 'error');
+    addRetryLog(`Please wait a moment and try again, or the server may wake up during the audit request.`, 'warning');
+    return false; // Wake-up failed after all retries
+  };
+
   const handleAudit = async (e) => {
     e.preventDefault();
     setLoading(true);
     setError(null);
     setResult(null);
+    setRetryLogs([]); // Clear previous retry logs
 
     // Normalize the URL before sending
     const normalizedUrl = normalizeUrl(url);
@@ -186,39 +252,211 @@ export default function SEOAuditApp() {
       return;
     }
 
-    try {
-      // Add timeout for the audit request (60 seconds for Render cold starts + processing)
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
-      
-      const response = await fetch(`${API_BASE_URL}/api/audit`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ url: normalizedUrl }),
-        signal: controller.signal,
-      });
-      
-      clearTimeout(timeoutId);
+    // Wake up server before proceeding with audit
+    addRetryLog('Checking if backend server is awake...', 'info');
+    const serverIsAwake = await wakeUpServerBeforeAudit();
+    
+    if (!serverIsAwake) {
+      // Wake-up failed after all retries - wait a bit more before proceeding
+      addRetryLog('Wake-up check completed but server may still be waking up. Proceeding with audit request (server may wake during request)...', 'warning');
+      // Give server a bit more time
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
 
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
+    // Close any existing SSE connection
+    if (sseConnection) {
+      sseConnection.close();
+      setSseConnection(null);
+    }
+
+    let eventSource = null;
+    let requestId = null;
+
+    try {
+      // Generate request_id on frontend first (same format as backend UUID)
+      requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      
+      addRetryLog(`Connecting to SSE stream... (request_id: ${requestId})`, 'info');
+      
+      // Connect to SSE BEFORE starting audit to catch all events
+      const sseUrl = `${API_BASE_URL}/api/audit/stream/${requestId}`;
+      eventSource = new EventSource(sseUrl);
+      setSseConnection(eventSource);
+      
+      // Wait a moment for SSE connection to establish or fail
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Handle SSE events
+      eventSource.onmessage = (event) => {
+          try {
+            const eventData = JSON.parse(event.data);
+            
+            // Add timestamp if not present
+            const timestamp = eventData.timestamp || formatTimestamp();
+            
+            // Handle different event types
+            if (eventData.type === 'connected') {
+              addRetryLog(`✓ SSE connection established`, 'success');
+            } else if (eventData.type === 'audit_started') {
+              addRetryLog(`Starting SEO audit for ${eventData.data.url}...`, 'info');
+            } else if (eventData.type === 'quota_exhausted_retry' || eventData.type === 'rate_limit_retry') {
+              const data = eventData.data;
+              addRetryLog(
+                `⚠️ ${data.agent_name}: ${data.message}`,
+                'warning'
+              );
+              addRetryLog(
+                `   Retry ${data.retry_attempt}/${data.max_retries} - Waiting ${data.total_wait_time}s (${data.retry_time_from_error ? `from error: ${data.retry_time_from_error}s` : `fallback`} + jitter: ${data.jitter}s)`,
+                'info'
+              );
+            } else if (eventData.type === 'retry_complete') {
+              addRetryLog(`✓ ${eventData.data.message}`, 'success');
+            } else if (eventData.type === 'audit_completed') {
+              addRetryLog(`✓ ${eventData.data.message}`, 'success');
+            } else if (eventData.type === 'audit_error') {
+              addRetryLog(`✗ Error: ${eventData.data.message}`, 'error');
+            }
+          } catch (err) {
+            console.error('Error parsing SSE event:', err);
+          }
+      };
+      
+      eventSource.onerror = (err) => {
+        console.error('SSE connection error:', err);
+        addRetryLog(`⚠️ SSE connection error: ${err.message || 'Connection failed'}`, 'warning');
+        // Don't close on error - it might reconnect, but also don't proceed if server is sleeping
+      };
+      
+      // Wait a moment for SSE connection to establish (or fail)
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Send audit request with retry logic for connection failures
+      const sendAuditRequest = async (attempt = 1, maxAttempts = 3) => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
+        
+        addRetryLog(`Sending audit request to backend... (Attempt ${attempt}/${maxAttempts})`, 'info');
+        
+        try {
+          const response = await fetch(`${API_BASE_URL}/api/audit`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ url: normalizedUrl, request_id: requestId }), // Send request_id if backend supports it
+            signal: controller.signal,
+          });
+          
+          clearTimeout(timeoutId);
+
+          if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+          }
+          
+          return response;
+        } catch (err) {
+          clearTimeout(timeoutId);
+          
+          // If connection failed and we have retries left, try again after waking up
+          if ((err.message && err.message.includes('Failed to fetch')) || err.name === 'AbortError') {
+            if (attempt < maxAttempts) {
+              addRetryLog(`✗ Audit request failed: ${err.message || err.name}`, 'error');
+              addRetryLog(`Retrying after waking up server again... (Attempt ${attempt + 1}/${maxAttempts})`, 'warning');
+              
+              // Try to wake up server again before retrying
+              await wakeUpServerBeforeAudit();
+              
+              // Wait a bit before retry
+              await new Promise(resolve => setTimeout(resolve, 2000));
+              
+              // Retry the request
+              return sendAuditRequest(attempt + 1, maxAttempts);
+            }
+          }
+          
+          // Re-throw if no retries left or different error
+          throw err;
+        }
+      };
+      
+      // Send audit request with retry logic
+      const response = await sendAuditRequest();
 
       const data = await response.json();
+      
+      addRetryLog(`✓ Audit request received response from backend`, 'success');
+      
+      // Use request_id from response if provided (backend may generate its own)
+      if (data.request_id && data.request_id !== requestId) {
+        requestId = data.request_id;
+        addRetryLog(`Backend provided different request_id. Reconnecting SSE stream...`, 'info');
+        // Close old connection and connect to new one
+        if (eventSource) {
+          eventSource.close();
+        }
+        const newSseUrl = `${API_BASE_URL}/api/audit/stream/${requestId}`;
+        eventSource = new EventSource(newSseUrl);
+        setSseConnection(eventSource);
+        // Re-setup handlers...
+        eventSource.onmessage = (event) => {
+          try {
+            const eventData = JSON.parse(event.data);
+            if (eventData.type === 'connected') {
+              addRetryLog(`✓ SSE connection established`, 'success');
+            } else if (eventData.type === 'audit_started') {
+              addRetryLog(`Starting SEO audit for ${eventData.data.url}...`, 'info');
+            } else if (eventData.type === 'quota_exhausted_retry' || eventData.type === 'rate_limit_retry') {
+              const data = eventData.data;
+              addRetryLog(`⚠️ ${data.agent_name}: ${data.message}`, 'warning');
+              addRetryLog(`   Retry ${data.retry_attempt}/${data.max_retries} - Waiting ${data.total_wait_time}s`, 'info');
+            } else if (eventData.type === 'retry_complete') {
+              addRetryLog(`✓ ${eventData.data.message}`, 'success');
+            } else if (eventData.type === 'audit_completed') {
+              addRetryLog(`✓ ${eventData.data.message}`, 'success');
+            }
+          } catch (err) {
+            console.error('Error parsing SSE event:', err);
+          }
+        };
+      }
+      
       setResult(data);
     } catch (err) {
+      // Close SSE connection on error
+      if (eventSource) {
+        eventSource.close();
+        setSseConnection(null);
+      }
+      
+      addRetryLog(`✗ Audit request failed: ${err.message || err.name}`, 'error');
+      
       if (err.name === 'AbortError') {
-        setError('Request timed out. The backend may be waking up or the audit is taking longer than expected. Please try again.');
-      } else if (err.message && err.message.includes('Failed to fetch')) {
-        setError('Failed to connect to the backend server. The server may be waking up (this can take 30-60 seconds on Render free tier). Please wait a moment and try again.');
+        const errorMsg = 'Request timed out after 2 minutes. The backend may be waking up or the audit is taking longer than expected. Please try again.';
+        setError(errorMsg);
+        addRetryLog(errorMsg, 'error');
+      } else if (err.message && (err.message.includes('Failed to fetch') || err.message.includes('Network'))) {
+        const errorMsg = 'Failed to connect to the backend server after multiple retry attempts. The server may still be waking up (this can take 30-60 seconds on Render free tier). Please wait a moment and try again.';
+        setError(errorMsg);
+        addRetryLog(errorMsg, 'error');
+        addRetryLog('💡 Tip: Wait 30-60 seconds after page load before submitting your first request on Render free tier.', 'info');
       } else {
-        setError(err.message || 'Failed to perform SEO audit. Please try again.');
+        const errorMsg = err.message || 'Failed to perform SEO audit. Please try again.';
+        setError(errorMsg);
+        addRetryLog(`Error: ${errorMsg}`, 'error');
       }
       console.error('Audit error:', err);
     } finally {
       setLoading(false);
+      // Don't close SSE immediately - let it close naturally or after timeout
+      // Clean up SSE connection after 5 seconds of no activity
+      if (eventSource) {
+        setTimeout(() => {
+          if (eventSource) {
+            eventSource.close();
+            setSseConnection(null);
+          }
+        }, 5000);
+      }
     }
   };
 
@@ -371,6 +609,56 @@ export default function SEOAuditApp() {
                     </div>
                   </div>
                 </details>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Retry Logs Display (during audit) */}
+        {loading && retryLogs.length > 0 && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-6 mb-8">
+            <div className="flex items-start mb-4">
+              <Loader2 className="w-6 h-6 text-yellow-600 mr-3 flex-shrink-0 mt-0.5 animate-spin" />
+              <div>
+                <h3 className="text-yellow-800 font-semibold mb-1">Backend Retry Activity</h3>
+                <p className="text-yellow-700 text-sm">
+                  The backend is handling retries and rate limits. Progress is shown below.
+                </p>
+              </div>
+            </div>
+            
+            {/* Live Retry Logs Display */}
+            <div className="mt-4 bg-gray-900 rounded-lg p-4 font-mono text-sm max-h-64 overflow-y-auto">
+              <div className="text-gray-400 mb-2 text-xs font-semibold">
+                LIVE RETRY LOGS - Backend Retry Progress
+              </div>
+              <div className="space-y-1">
+                {retryLogs.map((log, index) => (
+                  <div key={index} className="flex items-start">
+                    <span className="text-gray-500 mr-3 flex-shrink-0">
+                      [{log.timestamp}]
+                    </span>
+                    <span
+                      className={`${
+                        log.type === 'success'
+                          ? 'text-green-400'
+                          : log.type === 'error'
+                          ? 'text-red-400'
+                          : log.type === 'warning'
+                          ? 'text-yellow-400'
+                          : 'text-gray-300'
+                      }`}
+                    >
+                      {log.message}
+                    </span>
+                  </div>
+                ))}
+                {loading && (
+                  <div className="flex items-start text-gray-500">
+                    <span className="mr-3">[...]</span>
+                    <span className="animate-pulse">● Waiting for next event...</span>
+                  </div>
+                )}
               </div>
             </div>
           </div>

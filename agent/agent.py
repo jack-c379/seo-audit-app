@@ -17,8 +17,11 @@ import time
 import re
 import random
 from datetime import datetime
-import random
-from datetime import datetime
+import json
+import uuid
+import asyncio
+import threading
+from collections import defaultdict
 
 # Check Python version FIRST - MCP requires Python 3.10+
 if sys.version_info < (3, 10):
@@ -80,15 +83,39 @@ except ModuleNotFoundError as e:
     print("="*70, file=sys.stderr)
     sys.exit(1)
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging for production visibility
+# Use WARNING level to ensure retry logs are visible in production (Render logs)
+# Format logs with timestamps for better traceability
+log_level = os.getenv("LOG_LEVEL", "WARNING").upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.WARNING),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
+# Ensure error handler logs are visible (they use WARNING level)
+logger.setLevel(logging.WARNING)
 
 # Retry configuration
 MAX_RETRIES = 3  # Maximum number of retries for rate limit errors
 MAX_QUOTA_RETRIES = 2  # Maximum number of retries for quota exhaustion
 MAX_JITTER = 3  # Maximum jitter (random delay) in seconds to add to retry times
 FALLBACK_RETRY_DELAY = 5  # Fallback delay if retry time cannot be extracted from error message
+
+# SSE (Server-Sent Events) for streaming retry logs to frontend
+# Store event queues per request ID for SSE streaming
+sse_event_queues: Dict[str, asyncio.Queue] = {}  # request_id -> async queue for SSE
+
+# Thread-local storage for request_id (so error handlers can access it)
+_request_context = threading.local()
+
+def get_current_request_id() -> Optional[str]:
+    """Get the current request_id from thread-local storage."""
+    return getattr(_request_context, 'request_id', None)
+
+def set_current_request_id(request_id: Optional[str]):
+    """Set the current request_id in thread-local storage."""
+    _request_context.request_id = request_id
 
 # ============================================================================
 # Data Models
@@ -133,6 +160,36 @@ class SerpAnalysis(BaseModel):
 # ============================================================================
 # Error Handling with 429 Retry Logic
 # ============================================================================
+
+def emit_sse_event(request_id: Optional[str], event_type: str, data: Dict):
+    """
+    Emit an SSE event for streaming to frontend.
+    
+    Args:
+        request_id: Unique request identifier (None if not available, will try to get from thread-local)
+        event_type: Type of event (e.g., 'retry', 'quota_exhausted', 'rate_limit')
+        data: Event data dictionary
+    """
+    # If request_id not provided, try to get from thread-local storage
+    if not request_id:
+        request_id = get_current_request_id()
+    if not request_id:
+        return
+    
+    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    event = {
+        "type": event_type,
+        "timestamp": timestamp,
+        "data": data
+    }
+    
+    # Add to async queue if exists (for SSE streaming)
+    queue = sse_event_queues.get(request_id)
+    if queue:
+        try:
+            queue.put_nowait(event)
+        except (asyncio.QueueFull, RuntimeError):
+            pass  # Queue full or closed, skip this event
 
 def create_error_handler(agent_name: str):
     """Create error handler with dynamic retry times extracted from error messages."""
@@ -278,10 +335,29 @@ def create_error_handler(agent_name: str):
                     f"{'='*70}\n"
                 )
                 
+                # Emit SSE event for frontend visibility (request_id from thread-local)
+                emit_sse_event(None, "quota_exhausted_retry", {
+                    "agent_name": agent_name,
+                    "retry_attempt": quota_retry_count,
+                    "max_retries": MAX_QUOTA_RETRIES,
+                    "retry_time_from_error": extracted_retry_time,
+                    "jitter": round(jitter, 2),
+                    "total_wait_time": round(total_delay, 2),
+                    "quota_limit": quota_limit,
+                    "message": f"Quota exhausted. Waiting {total_delay:.2f}s before retry {quota_retry_count}/{MAX_QUOTA_RETRIES}..."
+                })
+                
                 # Wait with extracted time + jitter
                 time.sleep(total_delay)
                 
-                logger.info(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
+                logger.warning(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
+                
+                # Emit retry complete event
+                emit_sse_event(None, "retry_complete", {
+                    "agent_name": agent_name,
+                    "retry_attempt": quota_retry_count,
+                    "message": f"Retry {quota_retry_count}/{MAX_QUOTA_RETRIES} completed, retrying request..."
+                })
                 
                 # Re-raise to trigger retry
                 raise error
@@ -368,10 +444,29 @@ def create_error_handler(agent_name: str):
                     f"{'='*70}\n"
                 )
                 
+                # Emit SSE event for frontend visibility
+                emit_sse_event(None, "rate_limit_retry", {
+                    "agent_name": agent_name,
+                    "retry_attempt": current_retry,
+                    "max_retries": MAX_RETRIES,
+                    "retry_time_from_error": extracted_retry_time,
+                    "jitter": round(jitter, 2),
+                    "total_wait_time": round(total_delay, 2),
+                    "message": f"Rate limit hit. Waiting {total_delay:.2f}s before retry {current_retry}/{MAX_RETRIES}..."
+                })
+                
                 # Sleep with extracted time + jitter
                 time.sleep(total_delay)
                 
-                logger.info(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
+                # Use WARNING level to ensure visibility in production logs
+                logger.warning(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
+                
+                # Emit retry complete event
+                emit_sse_event(None, "retry_complete", {
+                    "agent_name": agent_name,
+                    "retry_attempt": current_retry,
+                    "message": f"Retry {current_retry}/{MAX_RETRIES} completed, retrying request..."
+                })
                 
                 # Re-raise to trigger ADK's retry mechanism
                 raise error
@@ -543,88 +638,7 @@ if __name__ == "__main__":
         # Create FastAPI app with ADK agent
         app = create_adk_app(root_agent)
         
-        # Add a lightweight ping endpoint to wake up the server
-        @app.get("/ping")
-        async def ping():
-            """Lightweight health check endpoint to wake up the server."""
-            return {"status": "ok", "message": "Server is awake"}
-        
-        # Add /api/audit endpoint for the frontend
-        class AuditRequest(BaseModel):
-            url: str
-        
-        @app.post("/api/audit")
-        async def audit_url(audit_request: AuditRequest):
-            """
-            SEO audit endpoint that accepts a URL and runs the audit agent.
-            
-            Expected request body:
-            {
-                "url": "https://example.com"
-            }
-            
-            Returns the agent's audit results.
-            """
-            try:
-                url = audit_request.url
-                if not url or not url.strip():
-                    return {"error": "URL is required", "status": "error"}, 400
-                
-                logger.info(f"Received audit request for URL: {url}")
-                
-                # Create a message/prompt for the agent
-                # ADK SequentialAgent can be called directly with a message
-                agent_message = f"Perform a comprehensive SEO audit for the website: {url}\n\nAnalyze the page structure, SEO elements, keywords, and provide recommendations."
-                
-                # Call the agent directly - ADK agents can be invoked synchronously
-                # Run in executor to avoid blocking the async event loop
-                import asyncio
-                from concurrent.futures import ThreadPoolExecutor
-                
-                def run_agent():
-                    try:
-                        # ADK SequentialAgent can be called like a function with a message
-                        result = root_agent(agent_message)
-                        return result
-                    except Exception as e:
-                        logger.error(f"Error calling agent: {e}", exc_info=True)
-                        raise
-                
-                # Run agent in executor
-                loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor() as executor:
-                    result = await loop.run_in_executor(executor, run_agent)
-                
-                # Format the response
-                # The result might be a string (markdown) or dict depending on agent output
-                if isinstance(result, str):
-                    # If it's a string (markdown report), wrap it in a structured format
-                    return {
-                        "status": "success",
-                        "url": url,
-                        "result": result,
-                        "summary": result[:500] + "..." if len(result) > 500 else result,
-                        "recommendations": []
-                    }
-                else:
-                    # If it's already structured (dict)
-                    return {
-                        "status": "success",
-                        "url": url,
-                        "result": result,
-                        "summary": result.get("summary", "") if isinstance(result, dict) else "",
-                        "recommendations": result.get("recommendations", []) if isinstance(result, dict) else []
-                    }
-                
-            except Exception as e:
-                logger.error(f"Error in /api/audit endpoint: {e}", exc_info=True)
-                return {
-                    "error": str(e),
-                    "status": "error",
-                    "message": "Failed to perform SEO audit. Please try again."
-                }, 500
-        
-        # Add CORS middleware to allow Next.js frontend to connect
+        # IMPORTANT: Add CORS middleware FIRST (before routes) to handle OPTIONS preflight requests
         # Build allowed origins list
         allowed_origins = [
             "http://localhost:3000",  # Next.js dev server
@@ -643,13 +657,198 @@ if __name__ == "__main__":
                     allowed_origins.append(origin)
                     logger.info(f"Added CORS origin from environment: {origin}")
         
+        # Add CORS middleware FIRST to handle OPTIONS preflight requests
         app.add_middleware(
             CORSMiddleware,
             allow_origins=allowed_origins,
             allow_credentials=True,
-            allow_methods=["*"],
+            allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],  # Explicitly include OPTIONS
             allow_headers=["*"],
+            expose_headers=["*"],
         )
+        
+        # Add a lightweight ping endpoint to wake up the server
+        @app.get("/ping")
+        async def ping():
+            """Lightweight health check endpoint to wake up the server."""
+            return {"status": "ok", "message": "Server is awake"}
+        
+        # Explicit OPTIONS handler for /ping (CORS middleware should handle this, but explicit is better)
+        @app.options("/ping")
+        async def ping_options():
+            """Handle OPTIONS preflight request for /ping endpoint."""
+            from fastapi.responses import Response
+            return Response(status_code=200)
+        
+        # SSE streaming endpoint for retry logs
+        @app.get("/api/audit/stream/{request_id}")
+        async def stream_audit_logs(request_id: str):
+            """
+            Server-Sent Events (SSE) endpoint for streaming retry logs to frontend.
+            
+            The frontend connects to this endpoint before starting an audit request.
+            Retry events are streamed in real-time as they occur.
+            """
+            from fastapi.responses import StreamingResponse
+            
+            async def event_generator():
+                # Create event queue for this request_id if it doesn't exist
+                if request_id not in sse_event_queues:
+                    sse_event_queues[request_id] = asyncio.Queue(maxsize=100)
+                
+                queue = sse_event_queues[request_id]
+                
+                try:
+                    # Send initial connection event
+                    yield f"data: {json.dumps({'type': 'connected', 'message': 'SSE connection established'})}\n\n"
+                    
+                    # Keep connection alive and stream events
+                    while True:
+                        try:
+                            # Wait for event with timeout to keep connection alive
+                            event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                            yield f"data: {json.dumps(event)}\n\n"
+                        except asyncio.TimeoutError:
+                            # Send keepalive ping every 30 seconds
+                            yield f": keepalive\n\n"
+                        except Exception as e:
+                            logger.error(f"Error in SSE stream for {request_id}: {e}")
+                            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+                            break
+                except asyncio.CancelledError:
+                    logger.info(f"SSE connection cancelled for {request_id}")
+                finally:
+                    # Clean up queue when connection closes
+                    if request_id in sse_event_queues:
+                        del sse_event_queues[request_id]
+            
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",  # Disable buffering for nginx
+                }
+            )
+        
+        # Add /api/audit endpoint for the frontend
+        class AuditRequest(BaseModel):
+            url: str
+            request_id: Optional[str] = None  # Optional: frontend can provide request_id for SSE
+        
+        @app.post("/api/audit")
+        async def audit_url(audit_request: AuditRequest):
+            """
+            SEO audit endpoint that accepts a URL and runs the audit agent.
+            
+            Expected request body:
+            {
+                "url": "https://example.com"
+            }
+            
+            Returns the agent's audit results.
+            """
+            try:
+                url = audit_request.url
+                if not url or not url.strip():
+                    return {"error": "URL is required", "status": "error"}, 400
+                
+                # Generate unique request_id for SSE streaming (use provided or generate new)
+                request_id = audit_request.request_id if audit_request.request_id else str(uuid.uuid4())
+                
+                # Create SSE event queue for this request
+                if request_id not in sse_event_queues:
+                    sse_event_queues[request_id] = asyncio.Queue(maxsize=100)
+                
+                # Send audit started event
+                emit_sse_event(request_id, "audit_started", {
+                    "url": url,
+                    "message": f"Starting SEO audit for {url}..."
+                })
+                
+                logger.info(f"Received audit request for URL: {url} (request_id: {request_id})")
+                
+                # Create a message/prompt for the agent
+                # ADK SequentialAgent can be called directly with a message
+                agent_message = f"Perform a comprehensive SEO audit for the website: {url}\n\nAnalyze the page structure, SEO elements, keywords, and provide recommendations."
+                
+                # Call the agent directly - ADK agents can be invoked synchronously
+                # Run in executor to avoid blocking the async event loop
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                def run_agent():
+                    try:
+                        # Set request_id in thread-local storage so error handlers can access it
+                        set_current_request_id(request_id)
+                        
+                        # ADK SequentialAgent can be called like a function with a message
+                        result = root_agent(agent_message)
+                        return result
+                    except Exception as e:
+                        logger.error(f"Error calling agent: {e}", exc_info=True)
+                        raise
+                    finally:
+                        # Clear thread-local storage
+                        set_current_request_id(None)
+                
+                # Run agent in executor
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    result = await loop.run_in_executor(executor, run_agent)
+                
+                # Send audit completed event
+                emit_sse_event(request_id, "audit_completed", {
+                    "url": url,
+                    "message": "SEO audit completed successfully"
+                })
+                
+                # Format the response
+                # The result might be a string (markdown) or dict depending on agent output
+                if isinstance(result, str):
+                    # If it's a string (markdown report), wrap it in a structured format
+                    return {
+                        "status": "success",
+                        "url": url,
+                        "request_id": request_id,  # Include request_id for SSE connection
+                        "result": result,
+                        "summary": result[:500] + "..." if len(result) > 500 else result,
+                        "recommendations": []
+                    }
+                else:
+                    # If it's already structured (dict)
+                    return {
+                        "status": "success",
+                        "url": url,
+                        "request_id": request_id,  # Include request_id for SSE connection
+                        "result": result,
+                        "summary": result.get("summary", "") if isinstance(result, dict) else "",
+                        "recommendations": result.get("recommendations", []) if isinstance(result, dict) else []
+                    }
+                
+            except Exception as e:
+                logger.error(f"Error in /api/audit endpoint: {e}", exc_info=True)
+                
+                # Send error event if request_id exists
+                if 'request_id' in locals():
+                    emit_sse_event(request_id, "audit_error", {
+                        "url": url if 'url' in locals() else None,
+                        "error": str(e),
+                        "message": "SEO audit failed. Please try again."
+                    })
+                    # Clean up queue
+                    if request_id in sse_event_queues:
+                        del sse_event_queues[request_id]
+                
+                return {
+                    "error": str(e),
+                    "status": "error",
+                    "message": "Failed to perform SEO audit. Please try again."
+                }, 500
+        
+        # CORS middleware was already added at the top (before routes) to handle OPTIONS preflight requests
+        # No need to add it again here - explicit OPTIONS handlers are already defined above
         
         # Print startup information
         print("="*70)
@@ -677,7 +876,9 @@ if __name__ == "__main__":
         # Start the server
         # Use PORT from environment (Render sets this automatically), fallback to 8000 for local dev
         port = int(os.getenv("PORT", "8000"))
-        uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
+        # Use warning level for uvicorn to ensure retry logs are visible in production
+        # The retry logic logs at WARNING level, so this ensures they appear in Render logs
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
         
     except ImportError as e:
         logger.error(f"Failed to import server dependencies: {e}")
