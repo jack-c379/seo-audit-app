@@ -85,6 +85,10 @@ MAX_RETRIES = 3
 INITIAL_RETRY_DELAY = 2  # seconds
 BACKOFF_MULTIPLIER = 2  # exponential backoff
 
+# Quota exhaustion retry configuration
+QUOTA_RETRY_DELAY = 30  # seconds - wait 30s for free tier quota reset (resets every minute)
+QUOTA_MAX_RETRIES = 2  # maximum retries for quota exhaustion
+
 # ============================================================================
 # Data Models
 # ============================================================================
@@ -132,6 +136,7 @@ class SerpAnalysis(BaseModel):
 def create_error_handler(agent_name: str):
     """Create error handler with exponential backoff for 429 rate limit errors."""
     retry_state = {}
+    quota_retry_state = {}  # Track quota exhaustion retries
     
     def handler(error: Exception = None, callback_context: Dict = None, **kwargs) -> None:
         """
@@ -156,37 +161,101 @@ def create_error_handler(agent_name: str):
             return
         
         error_str = str(error).lower()
+        error_repr = repr(error).lower()
+        full_error_text = f"{error_str} {error_repr}"
         
-        # Check for quota exhaustion (non-retryable)
+        # Check for quota exhaustion (non-retryable) - more comprehensive detection
         is_quota_exhausted = (
-            'resource_exhausted' in error_str or 
-            'quota exceeded' in error_str or
-            'current quota' in error_str
+            'resource_exhausted' in full_error_text or 
+            'quota exceeded' in full_error_text or
+            'current quota' in full_error_text or
+            'you exceeded your current quota' in full_error_text or
+            'free_tier_input_token_count' in full_error_text or
+            'free_tier' in full_error_text and 'quota' in full_error_text
         )
         
-        if is_quota_exhausted:
-            # Extract retry delay if available
-            retry_match = re.search(r'retry in (\d+(?:\.\d+)?)', error_str)
-            wait_time = retry_match.group(1) if retry_match else "unknown"
-            
-            logger.error(
-                f"\n{'='*70}\n"
-                f"{agent_name}: QUOTA EXHAUSTED\n"
-                f"{'='*70}\n"
-                f"You've exceeded your Gemini API quota limit.\n"
-                f"Wait time: {wait_time} seconds\n\n"
-                f"Solutions:\n"
-                f"1. Wait {wait_time}s and try again\n"
-                f"2. Check usage: https://ai.dev/usage?tab=rate-limit\n"
-                f"3. Upgrade plan: https://ai.google.dev/gemini-api/docs/rate-limits\n"
-                f"4. Use a different API key with available quota\n"
-                f"{'='*70}\n"
+        # Also check for 429 with specific quota-related keywords
+        is_429_quota = (
+            '429' in error_str and (
+                'resource_exhausted' in full_error_text or
+                'quota' in full_error_text and 'exceeded' in full_error_text
             )
-            # Don't retry - quota issues require waiting or upgrading
-            raise error
+        )
+        
+        if is_quota_exhausted or is_429_quota:
+            # Extract wait time from error message
+            retry_match = re.search(r'retry in (\d+(?:\.\d+)?)\s*s', error_str, re.IGNORECASE)
+            suggested_wait = retry_match.group(1) if retry_match else None
+            
+            # Extract quota limit information
+            quota_match = re.search(r'limit[:\s]+(\d+(?:,\d+)*)', full_error_text)
+            quota_limit = quota_match.group(1) if quota_match else "250,000 tokens/minute (free tier)"
+            
+            # Get agent instance ID for tracking quota retries
+            agent_obj = context.get('agent') if context else None
+            agent_id = id(agent_obj) if agent_obj else 0
+            quota_retry_count = quota_retry_state.get(agent_id, 0)
+            
+            # Try retry with 30-second wait if under max retries
+            if quota_retry_count < QUOTA_MAX_RETRIES:
+                quota_retry_state[agent_id] = quota_retry_count + 1
+                
+                logger.warning(
+                    f"\n{'='*70}\n"
+                    f"⚠️  {agent_name}: QUOTA EXHAUSTED - Attempting retry\n"
+                    f"{'='*70}\n"
+                    f"You've exceeded your Gemini API quota limit.\n"
+                    f"\nQuota Details:\n"
+                    f"  • Limit: {quota_limit}\n"
+                    f"  • Free tier resets every 60 seconds\n"
+                    f"\n🔄 Retry Strategy:\n"
+                    f"  • Retry {quota_retry_count + 1}/{QUOTA_MAX_RETRIES}\n"
+                    f"  • Waiting {QUOTA_RETRY_DELAY} seconds for quota reset...\n"
+                    f"  • This gives the quota time to reset (free tier resets per minute)\n"
+                    f"{'='*70}\n"
+                )
+                
+                # Wait 30 seconds for quota to reset
+                time.sleep(QUOTA_RETRY_DELAY)
+                
+                # Re-raise to trigger retry
+                raise error
+            else:
+                # Max quota retries exceeded
+                quota_retry_state[agent_id] = 0  # Reset for next request cycle
+                
+                wait_time = suggested_wait if suggested_wait else f"{QUOTA_RETRY_DELAY}+"
+                
+                logger.error(
+                    f"\n{'='*70}\n"
+                    f"❌ {agent_name}: QUOTA EXHAUSTED - Max Retries Exceeded\n"
+                    f"{'='*70}\n"
+                    f"You've exceeded your Gemini API quota limit.\n"
+                    f"Already retried {QUOTA_MAX_RETRIES} times with {QUOTA_RETRY_DELAY}s delays.\n"
+                    f"\nQuota Details:\n"
+                    f"  • Limit: {quota_limit}\n"
+                    f"  • Free tier resets every 60 seconds\n"
+                    f"\n💡 Solutions:\n"
+                    f"  1. ⏱️  Wait 1-2 minutes for quota to fully reset\n"
+                    f"  2. 📊 Check your current usage: https://ai.dev/usage?tab=rate-limit\n"
+                    f"  3. 🚀 Upgrade your plan: https://ai.google.dev/gemini-api/docs/rate-limits\n"
+                    f"  4. 🔑 Use a different API key with available quota\n"
+                    f"  5. 📅 Wait longer - free tier quota resets every minute\n"
+                    f"\nThe free tier allows 250,000 input tokens per minute per model.\n"
+                    f"If you need higher limits, consider upgrading to a paid plan.\n"
+                    f"{'='*70}\n"
+                )
+                # Don't retry anymore - raise error
+                raise error
         
         # Check for 429 rate limit error (temporary, retryable)
-        is_rate_limit = '429' in error_str and not is_quota_exhausted
+        # Only treat as rate limit if it's NOT quota exhaustion
+        is_rate_limit = (
+            '429' in error_str and 
+            not is_quota_exhausted and 
+            not is_429_quota and
+            'resource_exhausted' not in full_error_text
+        )
         
         # Check for other retryable errors
         other_retryable = any(kw in error_str for kw in 
@@ -381,6 +450,81 @@ if __name__ == "__main__":
         async def ping():
             """Lightweight health check endpoint to wake up the server."""
             return {"status": "ok", "message": "Server is awake"}
+        
+        # Add /api/audit endpoint for the frontend
+        class AuditRequest(BaseModel):
+            url: str
+        
+        @app.post("/api/audit")
+        async def audit_url(audit_request: AuditRequest):
+            """
+            SEO audit endpoint that accepts a URL and runs the audit agent.
+            
+            Expected request body:
+            {
+                "url": "https://example.com"
+            }
+            
+            Returns the agent's audit results.
+            """
+            try:
+                url = audit_request.url
+                if not url or not url.strip():
+                    return {"error": "URL is required", "status": "error"}, 400
+                
+                logger.info(f"Received audit request for URL: {url}")
+                
+                # Create a message/prompt for the agent
+                # ADK SequentialAgent can be called directly with a message
+                agent_message = f"Perform a comprehensive SEO audit for the website: {url}\n\nAnalyze the page structure, SEO elements, keywords, and provide recommendations."
+                
+                # Call the agent directly - ADK agents can be invoked synchronously
+                # Run in executor to avoid blocking the async event loop
+                import asyncio
+                from concurrent.futures import ThreadPoolExecutor
+                
+                def run_agent():
+                    try:
+                        # ADK SequentialAgent can be called like a function with a message
+                        result = root_agent(agent_message)
+                        return result
+                    except Exception as e:
+                        logger.error(f"Error calling agent: {e}", exc_info=True)
+                        raise
+                
+                # Run agent in executor
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    result = await loop.run_in_executor(executor, run_agent)
+                
+                # Format the response
+                # The result might be a string (markdown) or dict depending on agent output
+                if isinstance(result, str):
+                    # If it's a string (markdown report), wrap it in a structured format
+                    return {
+                        "status": "success",
+                        "url": url,
+                        "result": result,
+                        "summary": result[:500] + "..." if len(result) > 500 else result,
+                        "recommendations": []
+                    }
+                else:
+                    # If it's already structured (dict)
+                    return {
+                        "status": "success",
+                        "url": url,
+                        "result": result,
+                        "summary": result.get("summary", "") if isinstance(result, dict) else "",
+                        "recommendations": result.get("recommendations", []) if isinstance(result, dict) else []
+                    }
+                
+            except Exception as e:
+                logger.error(f"Error in /api/audit endpoint: {e}", exc_info=True)
+                return {
+                    "error": str(e),
+                    "status": "error",
+                    "message": "Failed to perform SEO audit. Please try again."
+                }, 500
         
         # Add CORS middleware to allow Next.js frontend to connect
         # Build allowed origins list

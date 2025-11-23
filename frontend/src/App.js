@@ -10,9 +10,67 @@ export default function SEOAuditApp() {
 
   const API_BASE_URL = 'https://seo-audit-app-s1y0.onrender.com';
 
+  // Normalize URL - add protocol if missing, handle www., and validate domain
+  const normalizeUrl = (inputUrl) => {
+    if (!inputUrl || !inputUrl.trim()) {
+      return '';
+    }
+
+    // Trim whitespace
+    let url = inputUrl.trim();
+
+    // Remove leading/trailing whitespace again after trim
+    url = url.replace(/^\s+|\s+$/g, '');
+
+    // Check if URL is empty after trimming
+    if (!url) {
+      return '';
+    }
+
+    // Check if URL already has a protocol
+    const hasProtocol = /^https?:\/\//i.test(url);
+    
+    if (hasProtocol) {
+      // Remove trailing slashes (but keep the domain structure)
+      url = url.replace(/\/+$/, '');
+      // Check if URL is just protocol (e.g., "https://" or "http://")
+      if (url === 'https://' || url === 'http://') {
+        return '';
+      }
+    } else {
+      // Remove any leading slashes that might be there
+      url = url.replace(/^\/+/, '');
+      // Remove trailing slashes
+      url = url.replace(/\/+$/, '');
+      
+      // Check if URL is empty after removing slashes
+      if (!url) {
+        return '';
+      }
+      
+      // Add https:// protocol
+      url = `https://${url}`;
+    }
+
+    // Basic validation: ensure we have at least a domain
+    // A valid URL should have at least one dot or be localhost
+    const urlWithoutProtocol = url.replace(/^https?:\/\//i, '');
+    if (!urlWithoutProtocol || (!urlWithoutProtocol.includes('.') && !urlWithoutProtocol.startsWith('localhost'))) {
+      return '';
+    }
+
+    // Return normalized URL
+    return url;
+  };
+
   // Ping the backend on initial load to wake it up if it's sleeping
+  // Render free tier can take 30-60 seconds to wake up, so we retry with exponential backoff
   useEffect(() => {
-    const wakeUpServer = async () => {
+    const wakeUpServer = async (retryCount = 0) => {
+      const MAX_RETRIES = 5;
+      const INITIAL_DELAY = 2000; // 2 seconds
+      const MAX_DELAY = 30000; // 30 seconds max between retries
+      
       try {
         setServerWakingUp(true);
         const response = await fetch(`${API_BASE_URL}/ping`, {
@@ -20,28 +78,45 @@ export default function SEOAuditApp() {
           headers: {
             'Content-Type': 'application/json',
           },
+          // Increase timeout for cold starts
+          signal: AbortSignal.timeout(10000), // 10 second timeout
         });
 
         if (response.ok) {
           const data = await response.json();
           console.log('Server is awake:', data);
           setServerWakingUp(false);
+          return; // Success - exit
         } else {
-          // Server might be waking up, don't show error immediately
-          console.log('Server waking up...');
-          // Retry after a short delay
-          setTimeout(() => {
-            setServerWakingUp(false);
-          }, 2000);
+          // Server is responding but with error - might be waking up
+          console.log(`Server waking up... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
         }
       } catch (err) {
-        // Network error - server is likely waking up
-        console.log('Server is waking up, please wait...', err.message);
-        // Still set to false after a delay to allow user to try
-        setTimeout(() => {
-          setServerWakingUp(false);
-        }, 3000);
+        // Network error - server is likely waking up (cold start)
+        if (err.name === 'AbortError') {
+          console.log(`Request timed out - server might be waking up (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+        } else {
+          console.log(`Server is waking up, please wait... (attempt ${retryCount + 1}/${MAX_RETRIES}):`, err.message);
+        }
+        
+        // Retry with exponential backoff if we haven't exceeded max retries
+        if (retryCount < MAX_RETRIES - 1) {
+          // Exponential backoff: 2s, 4s, 8s, 16s, 30s (capped at 30s)
+          const delay = Math.min(INITIAL_DELAY * Math.pow(2, retryCount), MAX_DELAY);
+          console.log(`Retrying in ${delay / 1000} seconds...`);
+          
+          setTimeout(() => {
+            wakeUpServer(retryCount + 1);
+          }, delay);
+          return; // Will retry
+        }
       }
+      
+      // If we get here, we've exhausted retries or got an error
+      // Still hide the loading message after a delay to allow user to try manually
+      setTimeout(() => {
+        setServerWakingUp(false);
+      }, 2000);
     };
 
     wakeUpServer();
@@ -53,14 +128,31 @@ export default function SEOAuditApp() {
     setError(null);
     setResult(null);
 
+    // Normalize the URL before sending
+    const normalizedUrl = normalizeUrl(url);
+
+    // Validate that we have a URL after normalization
+    if (!normalizedUrl || normalizedUrl === 'https://') {
+      setError('Please enter a valid website URL (e.g., example.com or https://example.com)');
+      setLoading(false);
+      return;
+    }
+
     try {
+      // Add timeout for the audit request (60 seconds for Render cold starts + processing)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 120000); // 2 minute timeout
+      
       const response = await fetch(`${API_BASE_URL}/api/audit`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url: normalizedUrl }),
+        signal: controller.signal,
       });
+      
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
@@ -69,7 +161,13 @@ export default function SEOAuditApp() {
       const data = await response.json();
       setResult(data);
     } catch (err) {
-      setError(err.message || 'Failed to perform SEO audit. Please try again.');
+      if (err.name === 'AbortError') {
+        setError('Request timed out. The backend may be waking up or the audit is taking longer than expected. Please try again.');
+      } else if (err.message && err.message.includes('Failed to fetch')) {
+        setError('Failed to connect to the backend server. The server may be waking up (this can take 30-60 seconds on Render free tier). Please wait a moment and try again.');
+      } else {
+        setError(err.message || 'Failed to perform SEO audit. Please try again.');
+      }
       console.error('Audit error:', err);
     } finally {
       setLoading(false);
@@ -99,16 +197,19 @@ export default function SEOAuditApp() {
               </label>
               <div className="relative">
                 <input
-                  type="url"
+                  type="text"
                   id="url"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  placeholder="https://example.com"
+                  placeholder="example.com or www.example.com"
                   required
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-transparent outline-none"
                 />
                 <Search className="absolute right-3 top-3.5 w-5 h-5 text-gray-400" />
               </div>
+              <p className="mt-2 text-sm text-gray-500">
+                You can enter just the domain name (e.g., example.com) or a full URL. Protocol (https://) is optional.
+              </p>
             </div>
 
             <button
