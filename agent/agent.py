@@ -15,6 +15,10 @@ import sys
 import logging
 import time
 import re
+import random
+from datetime import datetime
+import random
+from datetime import datetime
 
 # Check Python version FIRST - MCP requires Python 3.10+
 if sys.version_info < (3, 10):
@@ -80,14 +84,11 @@ except ModuleNotFoundError as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Retry configuration for 429 errors
-MAX_RETRIES = 3
-INITIAL_RETRY_DELAY = 2  # seconds
-BACKOFF_MULTIPLIER = 2  # exponential backoff
-
-# Quota exhaustion retry configuration
-QUOTA_RETRY_DELAY = 30  # seconds - wait 30s for free tier quota reset (resets every minute)
-QUOTA_MAX_RETRIES = 2  # maximum retries for quota exhaustion
+# Retry configuration
+MAX_RETRIES = 3  # Maximum number of retries for rate limit errors
+MAX_QUOTA_RETRIES = 2  # Maximum number of retries for quota exhaustion
+MAX_JITTER = 3  # Maximum jitter (random delay) in seconds to add to retry times
+FALLBACK_RETRY_DELAY = 5  # Fallback delay if retry time cannot be extracted from error message
 
 # ============================================================================
 # Data Models
@@ -134,9 +135,56 @@ class SerpAnalysis(BaseModel):
 # ============================================================================
 
 def create_error_handler(agent_name: str):
-    """Create error handler with exponential backoff for 429 rate limit errors."""
+    """Create error handler with dynamic retry times extracted from error messages."""
     retry_state = {}
     quota_retry_state = {}  # Track quota exhaustion retries
+    
+    def extract_retry_time(error_text: str) -> Optional[float]:
+        """
+        Extract retry time from error message.
+        
+        Looks for patterns like:
+        - "Please retry in 3.66431747s"
+        - "retry in 5.2 seconds"
+        - "retry after 10s"
+        
+        Returns the time in seconds as float, or None if not found.
+        """
+        # Multiple patterns to match different error message formats
+        patterns = [
+            r'retry in (\d+(?:\.\d+)?)\s*s(?:econds?)?',  # "retry in 3.5s" or "retry in 3.5 seconds"
+            r'retry after (\d+(?:\.\d+)?)\s*s(?:econds?)?',  # "retry after 5s"
+            r'Please retry in (\d+(?:\.\d+)?)\s*s',  # "Please retry in 3.66431747s"
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, error_text, re.IGNORECASE)
+            if match:
+                try:
+                    return float(match.group(1))
+                except (ValueError, IndexError):
+                    continue
+        
+        return None
+    
+    def add_jitter(base_delay: float, max_jitter: float = MAX_JITTER) -> float:
+        """
+        Add random jitter (0 to max_jitter seconds) to the delay.
+        This helps prevent thundering herd problems when multiple requests retry simultaneously.
+        
+        Args:
+            base_delay: Base delay in seconds
+            max_jitter: Maximum jitter to add (default: 3 seconds)
+        
+        Returns:
+            Delay with jitter added
+        """
+        jitter = random.uniform(0, max_jitter)
+        return base_delay + jitter
+    
+    def format_timestamp() -> str:
+        """Format current timestamp for logging."""
+        return datetime.now().strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
     
     def handler(error: Exception = None, callback_context: Dict = None, **kwargs) -> None:
         """
@@ -183,9 +231,8 @@ def create_error_handler(agent_name: str):
         )
         
         if is_quota_exhausted or is_429_quota:
-            # Extract wait time from error message
-            retry_match = re.search(r'retry in (\d+(?:\.\d+)?)\s*s', error_str, re.IGNORECASE)
-            suggested_wait = retry_match.group(1) if retry_match else None
+            # Extract retry time from error message
+            extracted_retry_time = extract_retry_time(full_error_text)
             
             # Extract quota limit information
             quota_match = re.search(r'limit[:\s]+(\d+(?:,\d+)*)', full_error_text)
@@ -196,27 +243,45 @@ def create_error_handler(agent_name: str):
             agent_id = id(agent_obj) if agent_obj else 0
             quota_retry_count = quota_retry_state.get(agent_id, 0)
             
-            # Try retry with 30-second wait if under max retries
-            if quota_retry_count < QUOTA_MAX_RETRIES:
-                quota_retry_state[agent_id] = quota_retry_count + 1
+            # Try retry if under max retries
+            if quota_retry_count < MAX_QUOTA_RETRIES:
+                quota_retry_count += 1
+                quota_retry_state[agent_id] = quota_retry_count
+                
+                # Use extracted retry time, or fallback to 30 seconds
+                base_delay = extracted_retry_time if extracted_retry_time is not None else 30.0
+                if base_delay < 1.0:  # Ensure minimum 1 second
+                    base_delay = 1.0
+                
+                # Add jitter (0 to 3 seconds)
+                jitter = random.uniform(0, MAX_JITTER)
+                total_delay = base_delay + jitter
+                
+                timestamp = format_timestamp()
+                
+                retry_time_msg = f"Retry time from error: {extracted_retry_time:.2f}s" if extracted_retry_time else f"Using fallback delay: {base_delay:.2f}s"
                 
                 logger.warning(
                     f"\n{'='*70}\n"
-                    f"⚠️  {agent_name}: QUOTA EXHAUSTED - Attempting retry\n"
+                    f"[{timestamp}] ⚠️  {agent_name}: QUOTA EXHAUSTED - Retrying\n"
                     f"{'='*70}\n"
                     f"You've exceeded your Gemini API quota limit.\n"
                     f"\nQuota Details:\n"
                     f"  • Limit: {quota_limit}\n"
                     f"  • Free tier resets every 60 seconds\n"
-                    f"\n🔄 Retry Strategy:\n"
-                    f"  • Retry {quota_retry_count + 1}/{QUOTA_MAX_RETRIES}\n"
-                    f"  • Waiting {QUOTA_RETRY_DELAY} seconds for quota reset...\n"
-                    f"  • This gives the quota time to reset (free tier resets per minute)\n"
+                    f"\n🔄 Retry Information:\n"
+                    f"  • Retry attempt: {quota_retry_count}/{MAX_QUOTA_RETRIES}\n"
+                    f"  • {retry_time_msg}\n"
+                    f"  • Jitter added: +{jitter:.2f}s (random 0-{MAX_JITTER}s)\n"
+                    f"  • Total wait time: {total_delay:.2f} seconds\n"
+                    f"\n⏱️  Waiting {total_delay:.2f} seconds before retry...\n"
                     f"{'='*70}\n"
                 )
                 
-                # Wait 30 seconds for quota to reset
-                time.sleep(QUOTA_RETRY_DELAY)
+                # Wait with extracted time + jitter
+                time.sleep(total_delay)
+                
+                logger.info(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
                 
                 # Re-raise to trigger retry
                 raise error
@@ -224,17 +289,19 @@ def create_error_handler(agent_name: str):
                 # Max quota retries exceeded
                 quota_retry_state[agent_id] = 0  # Reset for next request cycle
                 
-                wait_time = suggested_wait if suggested_wait else f"{QUOTA_RETRY_DELAY}+"
+                timestamp = format_timestamp()
+                wait_time_str = f"{extracted_retry_time:.2f}s" if extracted_retry_time else "30s+"
                 
                 logger.error(
                     f"\n{'='*70}\n"
-                    f"❌ {agent_name}: QUOTA EXHAUSTED - Max Retries Exceeded\n"
+                    f"[{timestamp}] ❌ {agent_name}: QUOTA EXHAUSTED - Max Retries Exceeded\n"
                     f"{'='*70}\n"
                     f"You've exceeded your Gemini API quota limit.\n"
-                    f"Already retried {QUOTA_MAX_RETRIES} times with {QUOTA_RETRY_DELAY}s delays.\n"
+                    f"Already retried {MAX_QUOTA_RETRIES} times.\n"
                     f"\nQuota Details:\n"
                     f"  • Limit: {quota_limit}\n"
                     f"  • Free tier resets every 60 seconds\n"
+                    f"  • Suggested wait time from error: {wait_time_str}\n"
                     f"\n💡 Solutions:\n"
                     f"  1. ⏱️  Wait 1-2 minutes for quota to fully reset\n"
                     f"  2. 📊 Check your current usage: https://ai.dev/usage?tab=rate-limit\n"
@@ -262,30 +329,61 @@ def create_error_handler(agent_name: str):
                             ['503', 'overloaded', 'unavailable'])
         
         if is_rate_limit:
+            # Extract retry time from error message
+            extracted_retry_time = extract_retry_time(full_error_text)
+            
             # Get agent instance ID for tracking retries
             agent_obj = context.get('agent') if context else None
             agent_id = id(agent_obj) if agent_obj else 0
             current_retry = retry_state.get(agent_id, 0)
             
             if current_retry < MAX_RETRIES:
-                # Calculate exponential backoff delay
-                delay = INITIAL_RETRY_DELAY * (BACKOFF_MULTIPLIER ** current_retry)
-                retry_state[agent_id] = current_retry + 1
+                current_retry += 1
+                retry_state[agent_id] = current_retry
+                
+                # Use extracted retry time from error message, or fallback delay
+                base_delay = extracted_retry_time if extracted_retry_time is not None else FALLBACK_RETRY_DELAY
+                if base_delay < 1.0:  # Ensure minimum 1 second
+                    base_delay = 1.0
+                
+                # Add jitter (0 to 3 seconds)
+                jitter = random.uniform(0, MAX_JITTER)
+                total_delay = base_delay + jitter
+                
+                timestamp = format_timestamp()
+                
+                retry_time_msg = f"Retry time from error: {extracted_retry_time:.2f}s" if extracted_retry_time else f"Using fallback delay: {base_delay:.2f}s"
                 
                 logger.warning(
-                    f"{agent_name}: Rate limit (429) hit. "
-                    f"Retry {current_retry + 1}/{MAX_RETRIES} after {delay}s delay..."
+                    f"\n{'='*70}\n"
+                    f"[{timestamp}] ⚠️  {agent_name}: RATE LIMIT (429) - Retrying\n"
+                    f"{'='*70}\n"
+                    f"Rate limit exceeded. The API has temporarily limited requests.\n"
+                    f"\n🔄 Retry Information:\n"
+                    f"  • Retry attempt: {current_retry}/{MAX_RETRIES}\n"
+                    f"  • {retry_time_msg}\n"
+                    f"  • Jitter added: +{jitter:.2f}s (random 0-{MAX_JITTER}s)\n"
+                    f"  • Total wait time: {total_delay:.2f} seconds\n"
+                    f"\n⏱️  Waiting {total_delay:.2f} seconds before retry...\n"
+                    f"{'='*70}\n"
                 )
                 
-                # Sleep with exponential backoff
-                time.sleep(delay)
+                # Sleep with extracted time + jitter
+                time.sleep(total_delay)
+                
+                logger.info(f"[{format_timestamp()}] Retrying after {total_delay:.2f}s wait...")
                 
                 # Re-raise to trigger ADK's retry mechanism
                 raise error
             else:
+                timestamp = format_timestamp()
                 logger.error(
-                    f"{agent_name}: Max retries ({MAX_RETRIES}) exceeded for rate limit. "
-                    f"Please wait a few minutes before trying again."
+                    f"\n{'='*70}\n"
+                    f"[{timestamp}] ❌ {agent_name}: RATE LIMIT - Max Retries Exceeded\n"
+                    f"{'='*70}\n"
+                    f"Rate limit exceeded and max retries ({MAX_RETRIES}) reached.\n"
+                    f"Please wait a few minutes before trying again.\n"
+                    f"{'='*70}\n"
                 )
                 retry_state[agent_id] = 0  # Reset for next request
                 raise error
@@ -310,7 +408,7 @@ if not FIRECRAWL_API_KEY:
 firecrawl_toolset = McpToolset(
     connection_params=StdioConnectionParams(
         server_params=StdioServerParameters(
-            command='npx',
+        command='npx',
             args=["-y", "firecrawl-mcp"],
             env={"FIRECRAWL_API_KEY": FIRECRAWL_API_KEY}
         ),

@@ -7,6 +7,7 @@ export default function SEOAuditApp() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [serverWakingUp, setServerWakingUp] = useState(true);
+  const [wakeUpLogs, setWakeUpLogs] = useState([]);
 
   const API_BASE_URL = 'https://seo-audit-app-s1y0.onrender.com';
 
@@ -63,9 +64,30 @@ export default function SEOAuditApp() {
     return url;
   };
 
+  // Helper function to format timestamp
+  const formatTimestamp = () => {
+    const now = new Date();
+    return now.toLocaleTimeString('en-US', { 
+      hour12: false, 
+      hour: '2-digit', 
+      minute: '2-digit', 
+      second: '2-digit',
+      fractionalSecondDigits: 3
+    });
+  };
+
+  // Helper function to add log entry
+  const addLog = (message, type = 'info') => {
+    const timestamp = formatTimestamp();
+    setWakeUpLogs(prev => [...prev, { timestamp, message, type }]);
+  };
+
   // Ping the backend on initial load to wake it up if it's sleeping
   // Render free tier can take 30-60 seconds to wake up, so we retry with exponential backoff
   useEffect(() => {
+    // Reset logs on mount
+    setWakeUpLogs([]);
+    
     const wakeUpServer = async (retryCount = 0) => {
       const MAX_RETRIES = 5;
       const INITIAL_DELAY = 2000; // 2 seconds
@@ -73,6 +95,10 @@ export default function SEOAuditApp() {
       
       try {
         setServerWakingUp(true);
+        addLog(`Attempting to ping backend server... (Attempt ${retryCount + 1}/${MAX_RETRIES})`, 'info');
+        addLog(`Target URL: ${API_BASE_URL}/ping`, 'info');
+        
+        const startTime = Date.now();
         const response = await fetch(`${API_BASE_URL}/ping`, {
           method: 'GET',
           headers: {
@@ -82,33 +108,51 @@ export default function SEOAuditApp() {
           signal: AbortSignal.timeout(10000), // 10 second timeout
         });
 
+        const endTime = Date.now();
+        const duration = ((endTime - startTime) / 1000).toFixed(2);
+
         if (response.ok) {
           const data = await response.json();
+          addLog(`✓ Server responded successfully (${duration}s)`, 'success');
+          addLog(`Response: ${JSON.stringify(data)}`, 'success');
+          addLog('Backend server is now awake and ready!', 'success');
           console.log('Server is awake:', data);
-          setServerWakingUp(false);
+          
+          // Wait a moment to show success message
+          setTimeout(() => {
+            setServerWakingUp(false);
+          }, 1000);
           return; // Success - exit
         } else {
           // Server is responding but with error - might be waking up
+          addLog(`⚠ Server responded with status ${response.status} (${duration}s)`, 'warning');
+          addLog(`Response may indicate server is still waking up...`, 'warning');
           console.log(`Server waking up... (attempt ${retryCount + 1}/${MAX_RETRIES})`);
         }
       } catch (err) {
         // Network error - server is likely waking up (cold start)
-        if (err.name === 'AbortError') {
-          console.log(`Request timed out - server might be waking up (attempt ${retryCount + 1}/${MAX_RETRIES})`);
-        } else {
-          console.log(`Server is waking up, please wait... (attempt ${retryCount + 1}/${MAX_RETRIES}):`, err.message);
-        }
+        const errorMessage = err.name === 'AbortError' 
+          ? 'Request timed out after 10 seconds'
+          : err.message || 'Network error';
+          
+        addLog(`✗ Request failed: ${errorMessage}`, 'error');
+        addLog(`Server may be in cold start (this is normal for Render free tier)`, 'error');
+        
+        console.log(`Server is waking up, please wait... (attempt ${retryCount + 1}/${MAX_RETRIES}):`, err.message);
         
         // Retry with exponential backoff if we haven't exceeded max retries
         if (retryCount < MAX_RETRIES - 1) {
           // Exponential backoff: 2s, 4s, 8s, 16s, 30s (capped at 30s)
           const delay = Math.min(INITIAL_DELAY * Math.pow(2, retryCount), MAX_DELAY);
+          addLog(`Retrying in ${delay / 1000} seconds... (exponential backoff)`, 'info');
           console.log(`Retrying in ${delay / 1000} seconds...`);
           
           setTimeout(() => {
             wakeUpServer(retryCount + 1);
           }, delay);
           return; // Will retry
+        } else {
+          addLog(`Max retries (${MAX_RETRIES}) reached. You can still try submitting a URL - the server may wake up during the audit request.`, 'warning');
         }
       }
       
@@ -119,6 +163,10 @@ export default function SEOAuditApp() {
       }, 2000);
     };
 
+    // Add initial log
+    addLog('Initializing backend wake-up sequence...', 'info');
+    addLog('This may take 30-60 seconds if the server is in cold start (normal for Render free tier)', 'info');
+    
     wakeUpServer();
   }, []);
 
@@ -232,16 +280,97 @@ export default function SEOAuditApp() {
           </form>
         </div>
 
-        {/* Server Wake-up Message */}
+        {/* Server Wake-up Message with Logs */}
         {serverWakingUp && (
-          <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-6 mb-8">
-            <div className="flex items-start">
-              <Loader2 className="w-6 h-6 text-yellow-600 mr-3 flex-shrink-0 mt-0.5 animate-spin" />
+          <div className="bg-blue-50 border border-blue-200 rounded-xl p-6 mb-8">
+            <div className="flex items-start mb-4">
+              <Loader2 className="w-6 h-6 text-blue-600 mr-3 flex-shrink-0 mt-0.5 animate-spin" />
               <div>
-                <h3 className="text-yellow-800 font-semibold mb-1">Server is waking up</h3>
-                <p className="text-yellow-700">
-                  Please wait a moment while the backend server wakes up. This usually takes 30-60 seconds if the server has been idle.
+                <h3 className="text-blue-800 font-semibold mb-1">Waking up backend server</h3>
+                <p className="text-blue-700 text-sm">
+                  Connecting to Render backend service. This may take 30-60 seconds if the server is in cold start.
                 </p>
+              </div>
+            </div>
+            
+            {/* Live Logs Display */}
+            {wakeUpLogs.length > 0 && (
+              <div className="mt-4 bg-gray-900 rounded-lg p-4 font-mono text-sm max-h-64 overflow-y-auto">
+                <div className="text-gray-400 mb-2 text-xs font-semibold">
+                  LIVE LOGS - Backend Wake-up Progress
+                </div>
+                <div className="space-y-1">
+                  {wakeUpLogs.map((log, index) => (
+                    <div key={index} className="flex items-start">
+                      <span className="text-gray-500 mr-3 flex-shrink-0">
+                        [{log.timestamp}]
+                      </span>
+                      <span
+                        className={`${
+                          log.type === 'success'
+                            ? 'text-green-400'
+                            : log.type === 'error'
+                            ? 'text-red-400'
+                            : log.type === 'warning'
+                            ? 'text-yellow-400'
+                            : 'text-gray-300'
+                        }`}
+                      >
+                        {log.message}
+                      </span>
+                    </div>
+                  ))}
+                  {serverWakingUp && (
+                    <div className="flex items-start text-gray-500">
+                      <span className="mr-3">[...]</span>
+                      <span className="animate-pulse">● Waiting for response...</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        
+        {/* Show recent logs even after wake-up completes (for a short time) */}
+        {!serverWakingUp && wakeUpLogs.length > 0 && (
+          <div className="bg-green-50 border border-green-200 rounded-xl p-6 mb-8">
+            <div className="flex items-start mb-3">
+              <CheckCircle className="w-6 h-6 text-green-600 mr-3 flex-shrink-0 mt-0.5" />
+              <div>
+                <h3 className="text-green-800 font-semibold mb-1">Backend server is ready</h3>
+                <p className="text-green-700 text-sm mb-3">
+                  The backend server is now awake and ready to process your requests.
+                </p>
+                <details className="mt-3">
+                  <summary className="text-green-700 text-sm cursor-pointer hover:text-green-800 font-medium">
+                    View connection logs ({wakeUpLogs.length} entries)
+                  </summary>
+                  <div className="mt-3 bg-gray-900 rounded-lg p-4 font-mono text-sm max-h-48 overflow-y-auto">
+                    <div className="space-y-1">
+                      {wakeUpLogs.map((log, index) => (
+                        <div key={index} className="flex items-start">
+                          <span className="text-gray-500 mr-3 flex-shrink-0">
+                            [{log.timestamp}]
+                          </span>
+                          <span
+                            className={`${
+                              log.type === 'success'
+                                ? 'text-green-400'
+                                : log.type === 'error'
+                                ? 'text-red-400'
+                                : log.type === 'warning'
+                                ? 'text-yellow-400'
+                                : 'text-gray-300'
+                            }`}
+                          >
+                            {log.message}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </details>
               </div>
             </div>
           </div>
